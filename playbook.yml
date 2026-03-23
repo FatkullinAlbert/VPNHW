@@ -1,0 +1,331 @@
+---
+- name: Configure VPN servers and clients
+  hosts: all
+  become: yes
+  vars:
+    openvpn_dir: /etc/openvpn
+    static_key_path: "{{ openvpn_dir }}/static.key"
+    iperf3_duration: 40
+    iperf3_interval: 5
+    # Для RAS используем отдельную подсеть
+    ras_server_network: "10.20.20.0 255.255.255.0"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - openvpn
+          - iperf3
+          - easy-rsa
+        state: present
+
+    - name: Disable SELinux (if present, safe for Ubuntu)
+      command: setenforce 0
+      ignore_errors: yes
+
+    - name: Ensure openvpn directory exists
+      file:
+        path: "{{ openvpn_dir }}"
+        state: directory
+
+    - name: Copy systemd service template
+      template:
+        src: openvpn@.service.j2
+        dest: /etc/systemd/system/openvpn@.service
+      notify: reload systemd
+
+    # ---------- Task 1: Static key setup ----------
+    - name: Generate static key on server
+      command: openvpn --genkey secret {{ static_key_path }}
+      when: inventory_hostname == "server"
+      args:
+        creates: "{{ static_key_path }}"
+
+    - name: Fetch static key from server to local
+      fetch:
+        src: "{{ static_key_path }}"
+        dest: /tmp/static.key
+        flat: yes
+      when: inventory_hostname == "server"
+
+    - name: Distribute static key to client
+      copy:
+        src: /tmp/static.key
+        dest: "{{ static_key_path }}"
+      when: inventory_hostname == "client"
+
+    # ---------- TUN mode configuration ----------
+    - name: Configure TUN mode server config
+      template:
+        src: server.conf.j2
+        dest: "{{ openvpn_dir }}/server.conf"
+      vars:
+        dev_mode: tun
+        is_server: true
+      when: inventory_hostname == "server"
+
+    - name: Configure TUN mode client config
+      template:
+        src: client.conf.j2
+        dest: "{{ openvpn_dir }}/client.conf"
+      vars:
+        dev_mode: tun
+        remote_ip: "192.168.56.10"
+      when: inventory_hostname == "client"
+
+    - name: Start OpenVPN in TUN mode (server)
+      systemd:
+        name: openvpn@server
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: inventory_hostname == "server"
+
+    - name: Start OpenVPN in TUN mode (client)
+      systemd:
+        name: openvpn@client
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: inventory_hostname == "client"
+
+    - name: Wait for tun interface to appear
+      shell: ip link show tun0
+      register: tun_iface
+      until: tun_iface.rc == 0
+      retries: 10
+      delay: 2
+      when: inventory_hostname == "client"
+      ignore_errors: yes
+
+    - name: Run iperf3 server on server (TUN)
+      shell: |
+        pkill iperf3 || true
+        iperf3 -s &
+      when: inventory_hostname == "server"
+      changed_when: false
+
+    - name: Run iperf3 client on client (TUN) and capture results
+      shell: |
+        iperf3 -c 10.10.10.1 -t {{ iperf3_duration }} -i {{ iperf3_interval }} | tee /tmp/iperf3_tun.log
+      when: inventory_hostname == "client"
+      changed_when: false
+
+    - name: Stop iperf3 server on server
+      shell: pkill iperf3
+      when: inventory_hostname == "server"
+      ignore_errors: yes
+
+    # Stop TUN tunnel to free resources
+    - name: Stop TUN OpenVPN instances
+      systemd:
+        name: "openvpn@{{ item }}"
+        state: stopped
+      loop:
+        - server
+        - client
+      when: inventory_hostname in ["server", "client"]
+
+    # ---------- TAP mode configuration ----------
+    - name: Configure TAP mode server config
+      template:
+        src: server.conf.j2
+        dest: "{{ openvpn_dir }}/server.conf"
+      vars:
+        dev_mode: tap
+        is_server: true
+      when: inventory_hostname == "server"
+
+    - name: Configure TAP mode client config
+      template:
+        src: client.conf.j2
+        dest: "{{ openvpn_dir }}/client.conf"
+      vars:
+        dev_mode: tap
+        remote_ip: "192.168.56.10"
+      when: inventory_hostname == "client"
+
+    - name: Start OpenVPN in TAP mode (server)
+      systemd:
+        name: openvpn@server
+        state: started
+      when: inventory_hostname == "server"
+
+    - name: Start OpenVPN in TAP mode (client)
+      systemd:
+        name: openvpn@client
+        state: started
+      when: inventory_hostname == "client"
+
+    - name: Wait for tap interface to appear
+      shell: ip link show tap0
+      register: tap_iface
+      until: tap_iface.rc == 0
+      retries: 10
+      delay: 2
+      when: inventory_hostname == "client"
+      ignore_errors: yes
+
+    - name: Run iperf3 server on server (TAP)
+      shell: |
+        pkill iperf3 || true
+        iperf3 -s &
+      when: inventory_hostname == "server"
+      changed_when: false
+
+    - name: Run iperf3 client on client (TAP) and capture results
+      shell: |
+        iperf3 -c 10.10.10.1 -t {{ iperf3_duration }} -i {{ iperf3_interval }} | tee /tmp/iperf3_tap.log
+      when: inventory_hostname == "client"
+      changed_when: false
+
+    - name: Stop iperf3 server on server
+      shell: pkill iperf3
+      when: inventory_hostname == "server"
+      ignore_errors: yes
+
+    # Stop TAP tunnel to free resources
+    - name: Stop TAP OpenVPN instances
+      systemd:
+        name: "openvpn@{{ item }}"
+        state: stopped
+      loop:
+        - server
+        - client
+      when: inventory_hostname in ["server", "client"]
+
+    # ---------- Task 2: RAS setup (only on server) ----------
+    - name: Prepare easy-rsa directory
+      file:
+        path: "{{ openvpn_dir }}/easy-rsa"
+        state: directory
+      when: inventory_hostname == "server"
+
+    - name: Initialize PKI and build CA for RAS
+      shell: |
+        cd {{ openvpn_dir }}/easy-rsa
+        /usr/share/easy-rsa/easyrsa init-pki
+        echo 'rasvpn' | /usr/share/easy-rsa/easyrsa build-ca nopass
+      args:
+        creates: "{{ openvpn_dir }}/easy-rsa/pki/ca.crt"
+      when: inventory_hostname == "server"
+
+    - name: Generate server certificate for RAS
+      shell: |
+        cd {{ openvpn_dir }}/easy-rsa
+        echo 'rasvpn-server' | /usr/share/easy-rsa/easyrsa gen-req server nopass
+        echo 'yes' | /usr/share/easy-rsa/easyrsa sign-req server server
+      args:
+        creates: "{{ openvpn_dir }}/easy-rsa/pki/issued/server.crt"
+      when: inventory_hostname == "server"
+
+    - name: Generate Diffie-Hellman parameters
+      shell: |
+        cd {{ openvpn_dir }}/easy-rsa
+        /usr/share/easy-rsa/easyrsa gen-dh
+      args:
+        creates: "{{ openvpn_dir }}/easy-rsa/pki/dh.pem"
+      when: inventory_hostname == "server"
+
+    - name: Generate client certificate for RAS
+      shell: |
+        cd {{ openvpn_dir }}/easy-rsa
+        echo 'client' | /usr/share/easy-rsa/easyrsa gen-req client nopass
+        echo 'yes' | /usr/share/easy-rsa/easyrsa sign-req client client
+      args:
+        creates: "{{ openvpn_dir }}/easy-rsa/pki/issued/client.crt"
+      when: inventory_hostname == "server"
+
+    - name: Create client config directory
+      file:
+        path: "{{ openvpn_dir }}/client"
+        state: directory
+      when: inventory_hostname == "server"
+
+    - name: Create iroute file for client
+      template:
+        src: ras_client_iroute.j2
+        dest: "{{ openvpn_dir }}/client/client"
+      when: inventory_hostname == "server"
+
+    - name: Configure RAS server
+      template:
+        src: ras_server.conf.j2
+        dest: "{{ openvpn_dir }}/ras-server.conf"
+      when: inventory_hostname == "server"
+
+    - name: Start RAS OpenVPN instance
+      systemd:
+        name: openvpn@ras-server
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: inventory_hostname == "server"
+
+    - name: Create directory for client files on host
+      file:
+        path: /vagrant/ras_client
+        state: directory
+      delegate_to: localhost
+      run_once: yes
+
+    - name: Copy client certificates to shared folder
+      fetch:
+        src: "{{ openvpn_dir }}/easy-rsa/pki/{{ item }}"
+        dest: /vagrant/ras_client/
+        flat: yes
+      loop:
+        - ca.crt
+        - issued/client.crt
+        - private/client.key
+      when: inventory_hostname == "server"
+
+    - name: Generate client.ovpn from template
+      template:
+        src: ras_client.ovpn.j2
+        dest: /vagrant/ras_client/client.ovpn
+      delegate_to: localhost
+      run_once: yes
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
